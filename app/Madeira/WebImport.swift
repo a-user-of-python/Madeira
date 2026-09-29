@@ -1,33 +1,22 @@
 import SwiftUI
 import Foundation
 
-// MARK: - Web server file import
+// MARK: - Import games: the app is the server
 //
-// "Import from Web" in the game loader: point the app at a web server on
-// your own network (for example `python3 -m http.server 8000` in a folder
-// of game files on your Mac), browse what it serves, and download straight
-// into the Wine prefix's C:\Games folder. Zip and .tar.gz archives are
-// extracted automatically; every downloaded .exe then shows up under
-// "Downloaded games" with a Run button that launches it through the
-// normal Wine sequence.
+// "Import Games" in the game loader: the app runs a tiny web server on the
+// iPhone/iPad and shows its address (e.g. http://192.168.1.10:8080). Open
+// that address in a browser on your computer and upload through the simple
+// page: pick .zip files (unzipped automatically into C:\Games) or whole
+// folders of game files (copied as-is into C:\Games). Every .exe found
+// under C:\Games then shows up below with a Run button that launches it
+// through the normal Wine sequence.
 //
-// Server listing: the app first tries <server>/index.json:
-//     [ {"name":"My Game.zip", "path":"games/mygame.zip", "size":1234567890}, ... ]
-// ("path" may be relative to the server root or a full URL; "size" is
-// optional.) If that fails it falls back to parsing a plain HTML directory
-// listing, which is what `python3 -m http.server` produces.
-//
-// Network note: Info.plist sets NSAllowsLocalNetworking so plain-HTTP works
-// against a server on your own Wi-Fi/LAN (e.g. the python one-liner above).
-// ATS stays enforced for everything else.
-
-/// One file offered by the web server.
-struct WebImportFile: Identifiable, Hashable {
-    let id = UUID()
-    let name: String
-    let url: URL
-    let size: Int64?
-}
+// The server is a minimal single-threaded HTTP/1.1 implementation over
+// POSIX sockets: GET / serves the upload page, POST /upload receives
+// multipart/form-data and streams it straight to disk (no size limit beyond
+// the disk itself). Uploaded names are sanitized: absolute paths and ".."
+// are rejected, and webkitdirectory relative paths ("folder/sub/game.exe")
+// are preserved.
 
 /// A downloaded .exe found under C:\Games, launchable through the loader.
 struct InstalledGame: Identifiable, Hashable {
@@ -36,78 +25,462 @@ struct InstalledGame: Identifiable, Hashable {
     let windowsPath: String // "C:\Games\Stray\game.exe"
 }
 
-/// Progress for one in-flight download.
-struct WebDownloadState {
-    var fileName: String
-    var fraction: Double?  // nil = indeterminate
-    var phase: String
+/// The device's IPv4 addresses (Wi-Fi first), for display in the UI.
+func deviceIPAddresses() -> [String] {
+    var out: [String] = []
+    var head: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&head) == 0, let first = head else { return [] }
+    defer { freeifaddrs(head) }
+    var ptr: UnsafeMutablePointer<ifaddrs>? = first
+    while let p = ptr {
+        ptr = p.pointee.ifa_next
+        let flags = Int32(p.pointee.ifa_flags)
+        guard flags & IFF_UP != 0, flags & IFF_RUNNING != 0,
+              flags & IFF_LOOPBACK == 0 else { continue }
+        guard let sa = p.pointee.ifa_addr,
+              sa.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        if getnameinfo(sa, socklen_t(sa.pointee.sa_len),
+                       &host, socklen_t(host.count), nil, 0,
+                       NI_NUMERICHOST) == 0 {
+            out.append(String(cString: host))
+        }
+    }
+    // Display order is fine as-is (usually Wi-Fi first already).
+    return out
 }
 
-/// Identifiable row wrapper for rendering the downloads dictionary.
-struct WebDownloadRow: Identifiable {
-    let id: UUID
-    let state: WebDownloadState
+/// Strips anything dangerous from an uploaded filename. Keeps
+/// webkitdirectory relative paths ("folder/sub/game.exe"); reduces
+/// "C:\fakepath\game.zip"-style names to their basename. Nil = reject.
+func sanitizedUploadPath(_ raw: String) -> String? {
+    var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if s.isEmpty { return nil }
+    let hadForwardSlash = s.contains("/")
+    s = s.replacingOccurrences(of: "\\", with: "/")
+    if !hadForwardSlash {
+        s = (s as NSString).lastPathComponent
+    }
+    if s.hasPrefix("/") { return nil }
+    let parts = s.split(separator: "/").map(String.init)
+        .filter { !$0.isEmpty && $0 != "." }
+    if parts.isEmpty || parts.contains("..") { return nil }
+    return parts.joined(separator: "/")
 }
 
-/// Delegate-based downloader: URLSessionDownloadTask streams big game files
-/// to disk instead of RAM, and the delegate reports progress.
-final class WebDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
-    var task: URLSessionDownloadTask?
-    var onProgress: ((Double?) -> Void)?
-    var onDone: ((URL?, Error?) -> Void)?
-    private var finished = false
+// MARK: - SocketReader: buffered, streaming socket reads
 
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
-                    totalBytesExpectedToWrite: Int64) {
-        let f: Double? = totalBytesExpectedToWrite > 0
-            ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) : nil
-        let cb = onProgress
-        DispatchQueue.main.async { cb?(f) }
+private final class SocketReader {
+    private let fd: Int32
+    private var buf = Data()
+
+    init(fd: Int32) { self.fd = fd }
+
+    private func fill() -> Bool {
+        var tmp = [UInt8](repeating: 0, count: 65536)
+        let n = recv(fd, &tmp, tmp.count, 0)
+        guard n > 0 else { return false }
+        buf.append(tmp, count: n)
+        return true
     }
 
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {
-        finished = true
-        // The system may delete `location` after this returns; take our own copy.
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("webimport-" + UUID().uuidString)
-        do {
-            try FileManager.default.copyItem(at: location, to: tmp)
-            let cb = onDone
-            DispatchQueue.main.async { cb?(tmp, nil) }
-        } catch {
-            let cb = onDone
-            DispatchQueue.main.async { cb?(nil, error) }
+    /// Reads up to and including `delim`; returns the bytes before it
+    /// (the delimiter itself is consumed). Nil on disconnect.
+    func readUntil(_ delim: Data) -> Data? {
+        while true {
+            if let r = buf.range(of: delim) {
+                let out = buf.subdata(in: buf.startIndex..<r.lowerBound)
+                buf.removeSubrange(buf.startIndex..<r.upperBound)
+                return out
+            }
+            if !fill() { return nil }
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    didCompleteWithError error: Error?) {
-        if !finished {
-            let cb = onDone
-            DispatchQueue.main.async { cb?(nil, error) }
+    /// Streaming readUntil: chunks are handed off as they arrive instead of
+    /// buffering the whole part. Returns false if the connection died first.
+    func readUntilStreaming(_ delim: Data, onChunk: (Data) -> Void) -> Bool {
+        while true {
+            if let r = buf.range(of: delim) {
+                let out = buf.subdata(in: buf.startIndex..<r.lowerBound)
+                if !out.isEmpty { onChunk(out) }
+                buf.removeSubrange(buf.startIndex..<r.upperBound)
+                return true
+            }
+            // Emit everything except a tail that could hold half a delimiter.
+            let keep = max(delim.count - 1, 0)
+            if buf.count > keep {
+                let end = buf.startIndex + (buf.count - keep)
+                onChunk(buf.subdata(in: buf.startIndex..<end))
+                buf.removeSubrange(buf.startIndex..<end)
+            }
+            if !fill() { return false }
         }
     }
+
+    func readLine() -> Data? {
+        readUntil(Data("\r\n".utf8))
+    }
+
+    func readExactly(_ count: Int) -> Data? {
+        while buf.count < count {
+            if !fill() { return nil }
+        }
+        let out = buf.subdata(in: buf.startIndex..<buf.startIndex + count)
+        buf.removeSubrange(buf.startIndex..<buf.startIndex + count)
+        return out
+    }
 }
+
+// MARK: - UploadServer
+
+/// Minimal HTTP/1.1 file-upload server. One connection at a time, handled on
+/// a background queue; all state callbacks hop to the main actor via the
+/// store.
+final class UploadServer {
+    var onEvent: ((String) -> Void)?
+    var onBatchComplete: (() -> Void)?
+
+    private var listenFD: Int32 = -1
+    private(set) var port: UInt16 = 0
+    private let lock = NSLock()
+
+    private func withFD<T>(_ body: (Int32) -> T) -> T {
+        lock.lock(); defer { lock.unlock() }
+        return body(listenFD)
+    }
+
+    var isRunning: Bool { withFD { $0 >= 0 } }
+
+    /// Binds 0.0.0.0 on the first free port in 8080...8099. Returns the port.
+    func start() throws -> UInt16 {
+        if isRunning { return port }
+        var lastError = "unknown"
+        for p in UInt16(8080)...UInt16(8099) {
+            do {
+                let fd = try bindPort(p)
+                lock.lock()
+                listenFD = fd
+                port = p
+                lock.unlock()
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    self?.serve()
+                }
+                return p
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        throw NSError(domain: "UploadServer", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey:
+                                 "No free port in 8080-8099 (\(lastError))"])
+    }
+
+    func stop() {
+        lock.lock()
+        if listenFD >= 0 {
+            shutdown(listenFD, SHUT_RDWR)
+            close(listenFD)
+            listenFD = -1
+        }
+        lock.unlock()
+    }
+
+    // MARK: internals (background thread)
+
+    private func sockErr(_ what: String) -> NSError {
+        NSError(domain: "UploadServer", code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                           "\(what) failed: \(String(cString: strerror(errno)))"])
+    }
+
+    private func bindPort(_ p: UInt16) throws -> Int32 {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw sockErr("socket") }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one,
+                   socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = p.bigEndian
+        addr.sin_addr = in_addr(s_addr: 0)
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard rc == 0 else { close(fd); throw sockErr("bind :\(p)") }
+        guard listen(fd, 8) == 0 else { close(fd); throw sockErr("listen") }
+        return fd
+    }
+
+    private func serve() {
+        while true {
+            var st = sockaddr_storage()
+            var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let lfd = withFD { $0 }
+            let fd = withUnsafeMutablePointer(to: &st) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(lfd, $0, &len)
+                }
+            }
+            if fd < 0 { break }  // socket closed by stop()
+            handleConnection(fd)
+        }
+    }
+
+    private func emit(_ line: String) {
+        onEvent?(line)
+    }
+
+    private func sendResponse(_ fd: Int32, _ status: Int, _ statusText: String,
+                              contentType: String, body: Data) {
+        let head = "HTTP/1.1 \(status) \(statusText)\r\n" +
+            "Content-Type: \(contentType)\r\n" +
+            "Content-Length: \(body.count)\r\n" +
+            "Connection: close\r\n\r\n"
+        var payload = Data(head.utf8)
+        payload.append(body)
+        payload.withUnsafeBytes { ptr in
+            var sent = 0
+            while sent < payload.count {
+                let n = send(fd, ptr.baseAddress!.advanced(by: sent),
+                             payload.count - sent, 0)
+                if n <= 0 { break }
+                sent += n
+            }
+        }
+    }
+
+    private func handleConnection(_ fd: Int32) {
+        defer { close(fd) }
+        let reader = SocketReader(fd: fd)
+        guard let headData = reader.readUntil(Data("\r\n\r\n".utf8)),
+              let head = String(data: headData, encoding: .utf8),
+              let requestLine = head.components(separatedBy: "\r\n").first else { return }
+        let parts = requestLine.split(separator: " ")
+        guard parts.count >= 2 else { return }
+        let method = String(parts[0])
+        let path = String(parts[1]).components(separatedBy: "?").first ?? "/"
+        var headers: [String: String] = [:]
+        for line in head.components(separatedBy: "\r\n").dropFirst() {
+            guard let c = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<c]).lowercased()
+                .trimmingCharacters(in: .whitespaces)
+            headers[key] = String(line[line.index(after: c)...])
+                .trimmingCharacters(in: .whitespaces)
+        }
+        if headers["expect"]?.lowercased() == "100-continue" {
+            let cont = Data("HTTP/1.1 100 Continue\r\n\r\n".utf8)
+            _ = cont.withUnsafeBytes { send(fd, $0.baseAddress!, cont.count, 0) }
+        }
+        if method == "GET" && path == "/" {
+            sendResponse(fd, 200, "OK",
+                         contentType: "text/html; charset=utf-8",
+                         body: Data(uploadPageHTML.utf8))
+        } else if method == "POST" && path == "/upload" {
+            handleUpload(fd: fd, reader: reader, headers: headers)
+        } else {
+            sendResponse(fd, 404, "Not Found",
+                         contentType: "text/plain",
+                         body: Data("not found".utf8))
+        }
+    }
+
+    private func handleUpload(fd: Int32, reader: SocketReader,
+                              headers: [String: String]) {
+        func fail(_ code: Int, _ text: String) {
+            sendResponse(fd, code, text, contentType: "text/plain",
+                         body: Data(text.utf8))
+        }
+        guard let ct = headers["content-type"],
+              ct.lowercased().contains("multipart/form-data"),
+              let bRange = ct.range(of: "boundary=",
+                                    options: .caseInsensitive) else {
+            fail(400, "need multipart"); return
+        }
+        var boundary = String(ct[bRange.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if boundary.hasPrefix("\"") {
+            boundary = String(boundary.dropFirst().prefix(while: { $0 != "\"" }))
+        }
+        if let semi = boundary.firstIndex(of: ";") {
+            boundary = String(boundary[..<semi])
+        }
+        guard !boundary.isEmpty else { fail(400, "no boundary"); return }
+
+        let gamesDir = WebImportStore.gamesDir
+        try? FileManager.default.createDirectory(at: gamesDir,
+                                                withIntermediateDirectories: true)
+
+        let firstDelim = Data(("--" + boundary).utf8)
+        guard reader.readLine() == firstDelim else {
+            fail(400, "bad body"); return
+        }
+
+        var received: [String] = []
+        var zips: [URL] = []
+        let partDelim = Data(("\r\n--" + boundary).utf8)
+
+        uploadLoop: while true {
+            guard let partHead = reader.readUntil(Data("\r\n\r\n".utf8)),
+                  let partHeadStr = String(data: partHead, encoding: .utf8) else { break }
+            var filename: String?
+            for line in partHeadStr.components(separatedBy: "\r\n") {
+                if let fr = line.range(of: "filename=",
+                                       options: .caseInsensitive) {
+                    var fn = String(line[fr.upperBound...])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if fn.hasPrefix("\"") {
+                        fn = String(fn.dropFirst().prefix(while: { $0 != "\"" }))
+                    }
+                    filename = fn
+                }
+            }
+            if let filename, let safe = sanitizedUploadPath(filename) {
+                let dest = gamesDir.appendingPathComponent(safe)
+                do {
+                    try FileManager.default.createDirectory(
+                        at: dest.deletingLastPathComponent(),
+                        withIntermediateDirectories: true)
+                    if FileManager.default.fileExists(atPath: dest.path) {
+                        try FileManager.default.removeItem(at: dest)
+                    }
+                    FileManager.default.createFile(atPath: dest.path,
+                                                   contents: nil)
+                    let fh = try FileHandle(forWritingTo: dest)
+                    let found = reader.readUntilStreaming(partDelim) { chunk in
+                        try? fh.write(contentsOf: chunk)
+                    }
+                    try? fh.close()
+                    if found {
+                        received.append(safe)
+                        if safe.lowercased().hasSuffix(".zip") {
+                            zips.append(dest)
+                        }
+                    } else {
+                        try? FileManager.default.removeItem(at: dest)
+                        break uploadLoop  // truncated upload
+                    }
+                } catch {
+                    break uploadLoop
+                }
+            } else {
+                // Not a file part: discard.
+                guard reader.readUntilStreaming(partDelim, onChunk: { _ in }) else {
+                    break uploadLoop
+                }
+            }
+            guard let trailer = reader.readExactly(2) else { break uploadLoop }
+            if trailer == Data("--".utf8) {
+                break uploadLoop  // final boundary
+            } else if trailer != Data("\r\n".utf8) {
+                break uploadLoop  // malformed
+            }
+        }
+
+        for zip in zips {
+            let target = gamesDir.appendingPathComponent(
+                (zip.lastPathComponent as NSString).deletingPathExtension)
+            try? FileManager.default.createDirectory(at: target,
+                                                    withIntermediateDirectories: true)
+            let rc: Int32 = zip.path.withCString { zp in
+                target.path.withCString { dp in madeira_extract_zip(zp, dp) }
+            }
+            if rc == 0 {
+                try? FileManager.default.removeItem(at: zip)
+                emit("Unzipped \(zip.lastPathComponent).")
+            } else {
+                emit("Could not unzip \(zip.lastPathComponent).")
+            }
+        }
+        for r in received {
+            emit("Received \(r).")
+        }
+        onBatchComplete?()
+        sendResponse(fd, 200, "OK", contentType: "text/plain",
+                     body: Data("ok".utf8))
+    }
+}
+
+// MARK: - Upload page (served by the app to the computer's browser)
+
+private let uploadPageHTML = """
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Madeira &mdash; Send games</title>
+<style>
+body{font-family:-apple-system,Helvetica,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;color:#111}
+h1{font-size:28px}p{font-size:17px;line-height:1.5}
+button{font-size:20px;padding:14px 28px;margin:12px 12px 12px 0;border-radius:12px;border:none;background:#0a84ff;color:#fff}
+button:active{background:#0066cc}
+progress{width:100%;height:24px;margin-top:16px}
+#msg{font-size:18px;margin-top:16px;min-height:28px}
+input[type=file]{font-size:17px;margin:8px 0;max-width:100%}
+.card{border:1px solid #ddd;border-radius:16px;padding:20px;margin:20px 0}
+</style></head>
+<body>
+<h1>Send games to Madeira</h1>
+<div class="card">
+<p><b>Zip files</b> &mdash; picked zips are unzipped automatically into the game folder.</p>
+<input type="file" id="zips" accept=".zip,application/zip" multiple><br>
+<button onclick="upload('zips')">Upload zips</button>
+</div>
+<div class="card">
+<p><b>Game folders</b> &mdash; a folder&rsquo;s files are copied as-is into the game folder.</p>
+<input type="file" id="folder" webkitdirectory><br>
+<button onclick="upload('folder')">Upload folder</button>
+</div>
+<progress id="prog" value="0" max="100"></progress>
+<div id="msg"></div>
+<script>
+function setMsg(t){document.getElementById('msg').textContent=t;}
+function upload(id){
+  var input=document.getElementById(id),files=input.files;
+  if(!files.length){setMsg('Pick something first.');return;}
+  var fd=new FormData();
+  for(var i=0;i<files.length;i++){
+    fd.append('files',files[i],files[i].webkitRelativePath||files[i].name);
+  }
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/upload');
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var p=Math.round(e.loaded/e.total*100);
+      document.getElementById('prog').value=p;
+      setMsg('Uploading... '+p+'%');
+    }
+  };
+  xhr.onload=function(){
+    document.getElementById('prog').value=xhr.status===200?100:0;
+    setMsg(xhr.status===200?'Done - check the app.':'Upload failed.');
+  };
+  xhr.onerror=function(){setMsg('Upload failed - is the app still open?');};
+  document.getElementById('prog').value=0;
+  setMsg('Uploading...');
+  xhr.send(fd);
+}
+</script>
+</body></html>
+"""
+
+// MARK: - Store
 
 @MainActor
 final class WebImportStore: ObservableObject {
     static let shared = WebImportStore()
 
-    @Published var serverURL = ""
-    @Published var files: [WebImportFile] = []
-    @Published var isLoadingList = false
-    @Published var listError: String?
-    @Published var statusMessage: String?
-    @Published var downloads: [UUID: WebDownloadState] = [:]
+    @Published var isServing = false
+    @Published var serverAddress = ""
+    @Published var extraAddresses: [String] = []
+    @Published var serverMessage: String?
+    @Published var receivedFiles: [String] = []
     @Published var installedGames: [InstalledGame] = []
 
-    // Retained for the life of each download (session keeps its delegate alive
-    // only weakly in some configurations; this dictionary owns both).
-    private var downloaders: [UUID: (URLSession, WebDownloadDelegate)] = [:]
-
-    private init() { loadSettings() }
+    private let server = UploadServer()
+    private init() {}
 
     // MARK: paths
 
@@ -118,215 +491,49 @@ final class WebImportStore: ObservableObject {
     static var gamesDir: URL {
         documents.appendingPathComponent("wine/drive_c/Games", isDirectory: true)
     }
-    private static var settingsURL: URL {
-        documents.appendingPathComponent("madeira-webimport.json")
-    }
 
-    private func loadSettings() {
-        guard let d = try? Data(contentsOf: Self.settingsURL),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: String] else { return }
-        serverURL = j["serverURL"] ?? ""
-    }
+    // MARK: server control
 
-    func saveSettings() {
-        guard let d = try? JSONSerialization.data(withJSONObject: ["serverURL": serverURL]) else { return }
-        try? d.write(to: Self.settingsURL, options: .atomic)
-    }
-
-    // MARK: listing
-
-    private func normalizedBase() -> URL? {
-        var s = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { return nil }
-        let lower = s.lowercased()
-        if !lower.hasPrefix("http://") && !lower.hasPrefix("https://") { s = "http://" + s }
-        guard var parts = URLComponents(string: s), parts.host != nil else { return nil }
-        if !parts.path.hasSuffix("/") { parts.path += "/" }
-        return parts.url
-    }
-
-    func refreshListing() async {
-        guard let base = normalizedBase() else {
-            listError = "Enter your server's address first."
-            return
-        }
-        isLoadingList = true
-        listError = nil
-        statusMessage = nil
-        files = []
-        defer { isLoadingList = false }
-
-        // 1) Structured listing: <server>/index.json
-        do {
-            let jsonURL = base.appendingPathComponent("index.json")
-            let (data, resp) = try await URLSession.shared.data(from: jsonURL)
-            if let http = resp as? HTTPURLResponse, http.statusCode == 200,
-               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                let items = arr.compactMap { entry -> WebImportFile? in
-                    guard let name = entry["name"] as? String, !name.isEmpty else { return nil }
-                    let rawPath = entry["path"] as? String ?? name
-                    let url: URL?
-                    if rawPath.lowercased().hasPrefix("http://") || rawPath.lowercased().hasPrefix("https://") {
-                        url = URL(string: rawPath)
-                    } else {
-                        url = URL(string: rawPath, relativeTo: base)?.absoluteURL
+    func startServer() {
+        server.onEvent = { [weak self] line in
+            Task { @MainActor in
+                guard let self else { return }
+                self.serverMessage = line
+                if line.hasPrefix("Received ") || line.hasPrefix("Unzipped ") ||
+                   line.hasPrefix("Could not ") {
+                    self.receivedFiles.insert(line, at: 0)
+                    if self.receivedFiles.count > 50 {
+                        self.receivedFiles.removeLast()
                     }
-                    guard let u = url else { return nil }
-                    var size: Int64?
-                    if let n = entry["size"] as? Int64 { size = n }
-                    else if let n = entry["size"] as? Int { size = Int64(n) }
-                    else if let n = entry["size"] as? Double { size = Int64(n) }
-                    return WebImportFile(name: name, url: u, size: size)
                 }
-                if !items.isEmpty {
-                    files = items
-                    statusMessage = "Found \(items.count) file(s)."
-                    return
-                }
+                LogStore.shared.log("Import server: \(line)")
             }
-        } catch {
-            // fall through to the HTML listing
         }
-
-        // 2) Plain HTML directory listing (what `python3 -m http.server` serves).
+        server.onBatchComplete = { [weak self] in
+            Task { @MainActor in self?.scanInstalledGames() }
+        }
         do {
-            let (data, _) = try await URLSession.shared.data(from: base)
-            let items = parseHTMLListing(data: data, base: base)
-            if items.isEmpty {
-                listError = "No files found. Serve an index.json, or a browsable folder (try: python3 -m http.server 8000)."
-            } else {
-                files = items
-                statusMessage = "Found \(items.count) file(s)."
-            }
+            let port = try server.start()
+            let ips = deviceIPAddresses()
+            let host = ips.first ?? "this-device"
+            serverAddress = "http://\(host):\(port)"
+            extraAddresses = ips.dropFirst().map { "http://\($0):\(port)" }
+            isServing = true
+            serverMessage = "Waiting for uploads..."
+            LogStore.shared.log("Import server running at \(serverAddress)",
+                                level: .success)
         } catch {
-            listError = "Could not reach the server: \(error.localizedDescription)"
-        }
-    }
-
-    private func parseHTMLListing(data: Data, base: URL) -> [WebImportFile] {
-        guard let html = String(data: data, encoding: .utf8)
-                ?? String(data: data, encoding: .isoLatin1) else { return [] }
-        let pattern = #"<a\s[^>]*href\s*=\s*"([^"]+)"[^>]*>(.*?)</a>"#
-        guard let re = try? NSRegularExpression(pattern: pattern,
-                options: [.caseInsensitive, .dotMatchesLineSeparators]) else { return [] }
-        let ns = html as NSString
-        var out: [WebImportFile] = []
-        var seen = Set<String>()
-        for m in re.matches(in: html, range: NSRange(location: 0, length: ns.length)) {
-            var href = ns.substring(with: m.range(at: 1))
-            var text = ns.substring(with: m.range(at: 2))
-            text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if href.hasPrefix("?") || href.hasPrefix("#") { continue }
-            if href == "../" || href == ".." { continue }
-            if href.hasPrefix("/") { continue }
-            if let q = href.firstIndex(of: "?") { href = String(href[..<q]) }
-            if href.isEmpty || href.hasSuffix("/") { continue }
-            guard let url = URL(string: href, relativeTo: base)?.absoluteURL else { continue }
-            guard seen.insert(url.absoluteString).inserted else { continue }
-            var name = text.isEmpty ? href : text
-            name = name.removingPercentEncoding ?? name
-            out.append(WebImportFile(name: name, url: url, size: nil))
-        }
-        return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
-
-    // MARK: downloads
-
-    func download(_ file: WebImportFile) {
-        let id = UUID()
-        downloads[id] = WebDownloadState(fileName: file.name, fraction: 0, phase: "Starting…")
-        let delegate = WebDownloadDelegate()
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        downloaders[id] = (session, delegate)
-        delegate.onProgress = { [weak self] f in
-            guard let self else { return }
-            Task { @MainActor in
-                self.downloads[id]?.fraction = f
-                self.downloads[id]?.phase = "Downloading…"
-            }
-        }
-        delegate.onDone = { [weak self] location, error in
-            guard let self else { return }
-            Task { @MainActor in
-                self.finishDownload(id: id, file: file, location: location, error: error)
-            }
-        }
-        let task = session.downloadTask(with: file.url)
-        delegate.task = task
-        task.resume()
-        LogStore.shared.log("Web import: downloading \(file.name)")
-    }
-
-    private func finishDownload(id: UUID, file: WebImportFile, location: URL?, error: Error?) {
-        defer { downloaders.removeValue(forKey: id) }
-        guard error == nil, let location else {
-            let msg = (error as? LocalizedError)?.errorDescription
-                ?? error?.localizedDescription ?? "unknown error"
-            downloads[id]?.phase = "Failed"
-            downloads[id]?.fraction = 0
-            listError = "Download failed: \(msg)"
-            LogStore.shared.log("Web import failed (\(file.name)): \(msg)", level: .error)
-            return
-        }
-        let fm = FileManager.default
-        do {
-            try fm.createDirectory(at: Self.gamesDir, withIntermediateDirectories: true)
-            var diskName = file.url.lastPathComponent
-            diskName = diskName.removingPercentEncoding ?? diskName
-            if diskName.isEmpty { diskName = file.name }
-            let dest = Self.gamesDir.appendingPathComponent(diskName)
-            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-            try fm.moveItem(at: location, to: dest)
-            LogStore.shared.log("Web import: saved \(diskName)", level: .success)
-
-            let lower = diskName.lowercased()
-            if lower.hasSuffix(".zip") {
-                downloads[id]?.phase = "Extracting…"
-                let target = Self.gamesDir
-                    .appendingPathComponent((diskName as NSString).deletingPathExtension)
-                try fm.createDirectory(at: target, withIntermediateDirectories: true)
-                let rc: Int32 = dest.path.withCString { zp in
-                    target.path.withCString { dp in madeira_extract_zip(zp, dp) }
-                }
-                if rc == 0 {
-                    try? fm.removeItem(at: dest)
-                    downloads[id]?.phase = "Done"
-                    downloads[id]?.fraction = 1
-                    LogStore.shared.log("Web import: extracted \(diskName)", level: .success)
-                } else {
-                    downloads[id]?.phase = "Extract failed"
-                    LogStore.shared.log("Web import: could not extract \(diskName)", level: .error)
-                }
-            } else if lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tgz") {
-                downloads[id]?.phase = "Extracting…"
-                var base = (diskName as NSString).deletingPathExtension
-                if lower.hasSuffix(".tar.gz") { base = (base as NSString).deletingPathExtension }
-                let target = Self.gamesDir.appendingPathComponent(base)
-                try fm.createDirectory(at: target, withIntermediateDirectories: true)
-                let rc: Int32 = dest.path.withCString { zp in
-                    target.path.withCString { dp in madeira_extract_prefix_tgz(zp, dp) }
-                }
-                if rc == 0 {
-                    try? fm.removeItem(at: dest)
-                    downloads[id]?.phase = "Done"
-                    downloads[id]?.fraction = 1
-                    LogStore.shared.log("Web import: extracted \(diskName)", level: .success)
-                } else {
-                    downloads[id]?.phase = "Extract failed"
-                    LogStore.shared.log("Web import: could not extract \(diskName)", level: .error)
-                }
-            } else {
-                downloads[id]?.phase = "Done"
-                downloads[id]?.fraction = 1
-            }
-            scanInstalledGames()
-        } catch {
-            downloads[id]?.phase = "Failed"
-            downloads[id]?.fraction = 0
-            LogStore.shared.log("Web import failed (\(file.name)): \(error.localizedDescription)",
+            serverMessage = "Could not start the server: \(error.localizedDescription)"
+            LogStore.shared.log("Import server failed: \(error.localizedDescription)",
                                 level: .error)
         }
+    }
+
+    func stopServer() {
+        server.stop()
+        isServing = false
+        serverMessage = nil
+        LogStore.shared.log("Import server stopped.")
     }
 
     // MARK: installed games
@@ -357,13 +564,6 @@ final class WebImportStore: ObservableObject {
 
 // MARK: - View
 
-private func formatBytes(_ bytes: Int64?) -> String {
-    guard let b = bytes, b > 0 else { return "" }
-    let f = ByteCountFormatter()
-    f.countStyle = .file
-    return f.string(fromByteCount: b)
-}
-
 struct WebImportView: View {
     @ObservedObject private var store = WebImportStore.shared
     var onRun: (String) -> Void
@@ -373,78 +573,61 @@ struct WebImportView: View {
         NavigationStack {
             List {
                 Section {
-                    TextField("Server address, e.g. 192.168.1.5:8000", text: $store.serverURL)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.title3)
-                    Button(store.isLoadingList ? "Loading…" : "Load file list") {
-                        Task { await store.refreshListing() }
+                    if store.isServing {
+                        Text("On your computer's browser, go to:")
+                            .font(.headline)
+                        Text(store.serverAddress)
+                            .font(.system(size: 30, weight: .bold,
+                                          design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(.vertical, 4)
+                        ForEach(store.extraAddresses, id: \.self) { addr in
+                            Text("Also: \(addr)")
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Button("Stop server") { store.stopServer() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.red)
+                            .font(.title3)
+                    } else {
+                        Text("Start the server, then open the address it shows in your computer's browser to upload games.")
+                            .font(.body)
+                        Button("Start server") { store.startServer() }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.cyan)
+                            .font(.title2)
                     }
-                    .font(.title3)
-                    .disabled(store.isLoadingList
-                              || store.serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    if let err = store.listError {
-                        Text(err).foregroundColor(.red).font(.body)
-                    }
-                    if let msg = store.statusMessage {
-                        Text(msg).foregroundColor(.secondary).font(.body)
+                    if let msg = store.serverMessage {
+                        Text(msg).font(.body).foregroundColor(.secondary)
                     }
                 } header: {
-                    Text("Web server").font(.headline)
+                    Text("Upload from your computer").font(.headline)
                 } footer: {
-                    Text("Your own computer on the same Wi-Fi. In the folder with your game files run: python3 -m http.server 8000 — then enter this Mac's IP and port above.")
+                    Text("Pick .zip files (unzipped automatically) or whole game folders (copied as-is). Everything lands in C:\\Games. Your computer must be on the same Wi-Fi. The server keeps running until you stop it. If the browser can't connect, allow Local Network access for Madeira in the Settings app.")
                         .font(.body)
                 }
 
-                if !store.downloads.isEmpty {
-                    Section("Downloads") {
-                        ForEach(sortedDownloads) { item in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(item.state.fileName).font(.body)
-                                if let f = item.state.fraction {
-                                    ProgressView(value: f).tint(.cyan)
-                                } else {
-                                    ProgressView().tint(.cyan)
-                                }
-                                Text(item.state.phase).font(.caption).foregroundColor(.secondary)
-                            }
-                            .padding(.vertical, 2)
+                if !store.receivedFiles.isEmpty {
+                    Section("Received") {
+                        ForEach(store.receivedFiles, id: \.self) { line in
+                            Text(line).font(.body)
                         }
-                    }
-                }
-
-                Section("Files on the server") {
-                    if store.files.isEmpty {
-                        Text("No files listed yet.").foregroundColor(.secondary).font(.body)
-                    }
-                    ForEach(store.files) { file in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(file.name).font(.body)
-                                let sz = formatBytes(file.size)
-                                if !sz.isEmpty {
-                                    Text(sz).font(.caption).foregroundColor(.secondary)
-                                }
-                            }
-                            Spacer()
-                            Button("Download") { store.download(file) }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.cyan)
-                        }
-                        .padding(.vertical, 2)
                     }
                 }
 
                 Section {
                     if store.installedGames.isEmpty {
-                        Text("Nothing downloaded yet.").foregroundColor(.secondary).font(.body)
+                        Text("Nothing here yet — upload a game above.")
+                            .foregroundColor(.secondary).font(.body)
                     }
                     ForEach(store.installedGames) { game in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(game.name).font(.body)
-                                Text(game.windowsPath).font(.caption).foregroundColor(.secondary)
+                                Text(game.windowsPath).font(.caption)
+                                    .foregroundColor(.secondary)
                             }
                             Spacer()
                             Button("Run") {
@@ -459,13 +642,13 @@ struct WebImportView: View {
                     }
                     Button("Rescan") { store.scanInstalledGames() }.font(.body)
                 } header: {
-                    Text("Downloaded games").font(.headline)
+                    Text("Games on this device").font(.headline)
                 } footer: {
                     Text("Run launches the game through the normal Wine sequence (enable JIT first).")
                         .font(.body)
                 }
             }
-            .navigationTitle("Import from Web")
+            .navigationTitle("Import Games")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -473,12 +656,6 @@ struct WebImportView: View {
                 }
             }
             .onAppear { store.scanInstalledGames() }
-            .onDisappear { store.saveSettings() }
         }
-    }
-
-    private var sortedDownloads: [WebDownloadRow] {
-        store.downloads.map { WebDownloadRow(id: $0.key, state: $0.value) }
-            .sorted { $0.state.fileName < $1.state.fileName }
     }
 }

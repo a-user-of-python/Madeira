@@ -1146,7 +1146,7 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
-    /// Shows the "Import from Web" sheet (web-server game import).
+    /// Shows the "Import Games" sheet (upload games from your computer).
     @State private var showWebImport = false
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
@@ -1518,9 +1518,9 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
-                // Web-server game import: download game files from your own
-                // computer into C:\Games, then run them from the loader.
-                Button("Import from Web") {
+                // Game import: this device serves an upload page on your Wi-Fi;
+                // send it zips (auto-unzipped) or game folders from your Mac.
+                Button("Import Games") {
                     showWebImport = true
                 }
                 .buttonStyle(.borderedProminent)
