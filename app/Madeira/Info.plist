@@ -26,6 +26,14 @@
 	<true/>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.games</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- "Import from Web": plain HTTP is allowed to servers on your own
+		local network only (e.g. python3 -m http.server on your Mac).
+		ATS stays enforced for everything else. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>stikjit</string>

@@ -2,6 +2,7 @@
 #import "FEXBridge.h"
 #import "WineServerBridge.h"
 #import "WineProcessBridge.h"
+#import "PrefixExtractor.h"
 #import "IOSDisplayShim.h"
 #import "Winios/Winios.h"
 #import "Winios/WiniosCursor.h"

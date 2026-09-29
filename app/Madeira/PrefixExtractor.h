@@ -7,4 +7,9 @@
 // not dest_dir/prefix/drive_c/...).
 int madeira_extract_prefix_tgz(const char *tgz_path, const char *dest_dir);
 
+// Extracts a zip archive (stored or deflated entries) into dest_dir.
+// Returns 0 on success, -1 on error. Rejects encrypted entries, absolute
+// paths and ".." traversal. Used by the "Import from Web" game loader.
+int madeira_extract_zip(const char *zip_path, const char *dest_dir);
+
 #endif

@@ -1146,6 +1146,8 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
+    /// Shows the "Import from Web" sheet (web-server game import).
+    @State private var showWebImport = false
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -1310,6 +1312,16 @@ struct ContentView: View {
             actionButtons
             Divider()
             logConsole
+        }
+        .sheet(isPresented: $showWebImport) {
+            WebImportView { exePath in
+                // Launch the imported .exe through the normal Wine sequence.
+                exePath.withCString { cstr in setenv("MADEIRA_EXE", cstr, 1) }
+                unsetenv("MADEIRA_ARGS")
+                unsetenv("MADEIRA_DESKTOP")
+                logStore.log("Launching imported game: \(exePath)")
+                runWineFullSequence()
+            }
         }
     }
 
@@ -1505,6 +1517,14 @@ struct ContentView: View {
                     enableJITViaStikDebug()
                 }
                 .buttonStyle(.borderedProminent)
+
+                // Web-server game import: download game files from your own
+                // computer into C:\Games, then run them from the loader.
+                Button("Import from Web") {
+                    showWebImport = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
 
                 Button("Steam Testing") {
                     // Steam S3 first boot: virtual desktop (Steam needs a
